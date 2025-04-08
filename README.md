@@ -1,6 +1,10 @@
 # AutoGenTestCase
 借助AI大模型帮助生成测试用例
 
+### 模型收费情况：
+#### DeepSeek申请apikey后需要充值金额才能使用，收费标准比较低2元可以使用上百次不止，放心大胆使用
+#### 通义千问申请apikey后会先赠送百万tokens（够用），收费标准也不较低，放心使用
+
 ### 申请DeepSeek的apikey
 1、链接：https://platform.deepseek.com/api_keys
 2、注册账号并登录
