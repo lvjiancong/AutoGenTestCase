@@ -1,9 +1,7 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-from autogen_ext.models.openai import OpenAIChatCompletionClient
-from autogen_agentchat.conditions import TextMentionTermination
-from autogen_agentchat.teams import RoundRobinGroupChat
-from autogen_agentchat.agents import AssistantAgent
+import autogen
+from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
 import streamlit.components.v1 as components
 from configparser import ConfigParser
 from pathlib import Path
@@ -12,7 +10,6 @@ from io import BytesIO
 from llms import *
 import xlsxwriter
 import platform
-import asyncio
 import base64
 import time
 import os
@@ -48,7 +45,7 @@ def session_init():
 
 
 def main():
-    if pt in ["Windows"]:
+    if pt in ["Windows", "Darwin"]:  # 添加对macOS(Darwin)的支持
         session_init()  # session缓存初始化
         css_init()  # 前端css样式初始化
         html_init()  # 前端html布局初始化
@@ -68,7 +65,7 @@ def cs_404():
 
 
 def img_to_bytes(img_path):
-    img_bytes = Path(os.path.split(os.path.realpath(__file__))[0] + "\\" + img_path).read_bytes()
+    img_bytes = Path(os.path.join(os.path.split(os.path.realpath(__file__))[0], img_path)).read_bytes()
     encoded = base64.b64encode(img_bytes).decode()
     return encoded
 
@@ -82,23 +79,21 @@ def read_system_message(filename):
 
 # 创建测试用例生成器代理
 @st.cache_resource
-def get_testcase_writer(_mode_client, system_message):
+def get_testcase_writer(llm_config, system_message):
     return AssistantAgent(
         name="testcase_writer",
-        model_client=_mode_client,
+        llm_config=llm_config,
         system_message=system_message,
-        # model_client_stream=True,
     )
 
 
 # 创建评审用例生成器代理
 @st.cache_resource
-def get_testcase_reader(_mode_client, system_message):
+def get_testcase_reader(llm_config, system_message):
     return AssistantAgent(
         name="critic",
-        model_client=_mode_client,
+        llm_config=llm_config,
         system_message=system_message,
-        model_client_stream=True,
     )
 
 
@@ -383,94 +378,143 @@ def html_init():
                     response_container = st.container()
 
                     # 多角色参与生成用例
-                    async def m_roles_generate_testcases():
-                        full_response = ""
-                        is_continue = True
-                        text_termination = TextMentionTermination("APPROVE")
-                        model_deepseek_client = OpenAIChatCompletionClient(
-                            model=conf['deepseek']['model'],
-                            base_url=conf['deepseek']['base_url'],
-                            api_key=conf['deepseek']['api_key'],
-                            model_info=model_deepseek_info,
+                    def m_roles_generate_testcases():
+                        # 配置DeepSeek
+                        deepseek_config = {
+                            "config_list": [{
+                                "model": conf['deepseek']['model'],
+                                "base_url": conf['deepseek']['base_url'],
+                                "api_key": conf['deepseek']['api_key'],
+                                "stream": True  # DeepSeek模型要求启用流模式
+                            }],
+                            "temperature": float(conf['deepseek']['temperature']) / 10,
+                            "max_tokens": int(conf['deepseek']['tokens'])
+                        }
+                        
+                        # 配置Qwen
+                        qwen_config = {
+                            "config_list": [{
+                                "model": conf['qwen']['model'],
+                                "base_url": conf['qwen']['base_url'],
+                                "api_key": conf['qwen']['api_key'],
+                                "stream": True  # 启用流模式以保持一致性
+                            }],
+                            "temperature": float(conf['qwen']['temperature']) / 10,
+                            "max_tokens": int(conf['qwen']['tokens'])
+                        }
+                        
+                        # 创建代理
+                        testcase_writer = get_testcase_writer(deepseek_config, customer_system_message)
+                        testcase_reader = get_testcase_reader(qwen_config, customer_reader_message)
+                        
+                        # 创建用户代理
+                        user_proxy = UserProxyAgent(
+                            name="user_proxy",
+                            human_input_mode="NEVER",
+                            max_consecutive_auto_reply=0,
+                            code_execution_config=False,
                         )
-                        testcase_writer = get_testcase_writer(model_deepseek_client, customer_system_message)
-                        model_qwen_client = OpenAIChatCompletionClient(
-                            model=conf['qwen']['model'],
-                            base_url=conf['qwen']['base_url'],
-                            api_key=conf['qwen']['api_key'],
-                            model_info=model_qwen_info,
-                        )
-                        testcase_reader = get_testcase_reader(model_qwen_client, customer_reader_message)
-                        team = RoundRobinGroupChat(
-                            participants=[testcase_writer, testcase_reader],
-                            termination_condition=text_termination,
-                            max_turns=10
-                        )
+                        
                         # 创建一个空元素用于更新内容
                         with response_container:
                             placeholder = st.empty()
-                        async for chunk in team.run_stream(task=task):
-                            content = ""
-                            if chunk:
-                                # 处理不同类型的chunk
-                                if hasattr(chunk, 'content') and hasattr(chunk, 'type'):
-                                    if chunk.type != 'ModelClientStreamingChunkEvent':
-                                        content = chunk.content
-                                elif isinstance(chunk, str):
-                                    content = chunk
-                                else:
-                                    content = str(chunk)
-                                # 将新内容添加到完整响应中
-                                if is_continue and content != "" and not content.startswith("TaskResult"):
-                                    full_response += '\n\n' + content
-                                # 更新显示区域（替换而非追加）
-                                placeholder.markdown(full_response)
-                                # APPROVE结束退出
-                                if content.find("APPROVE") > 0:
-                                    is_continue = False
-
+                            placeholder.text("正在生成测试用例...")
+                        
+                        # 首先让writer生成用例
+                        writer_result = user_proxy.initiate_chat(
+                            testcase_writer,
+                            message=task,
+                            max_turns=1,
+                            silent=True
+                        )
+                        
+                        # 获取writer的回复
+                        writer_response = ""
+                        if hasattr(testcase_writer, 'chat_messages'):
+                            chat_messages = testcase_writer.chat_messages.get(user_proxy, [])
+                            for msg in reversed(chat_messages):
+                                if msg.get('role') == 'assistant':
+                                    writer_response = msg.get('content', '')
+                                    break
+                        
+                        # 让reader评审用例
+                        reader_task = f"请评审以下测试用例：\n\n{writer_response}\n\n评审完成后，如果用例合格请回复'APPROVE'。"
+                        reader_result = user_proxy.initiate_chat(
+                            testcase_reader,
+                            message=reader_task,
+                            max_turns=1,
+                            silent=True
+                        )
+                        
+                        # 获取reader的回复
+                        reader_response = ""
+                        if hasattr(testcase_reader, 'chat_messages'):
+                            chat_messages = testcase_reader.chat_messages.get(user_proxy, [])
+                            for msg in reversed(chat_messages):
+                                if msg.get('role') == 'assistant':
+                                    reader_response = msg.get('content', '')
+                                    break
+                        
+                        # 组合结果
+                        full_response = f"{writer_response}\n\n--- 评审意见 ---\n{reader_response}"
+                        
+                        # 更新显示
+                        with response_container:
+                            placeholder.markdown(full_response)
+                        
                         return full_response
 
                     # 单角色参与生成用例
-                    async def s_roles_generate_testcases():
-                        full_response = ""
-                        is_continue = True
-                        text_termination = TextMentionTermination("APPROVE")
-                        model_deepseek_client = OpenAIChatCompletionClient(
-                            model=conf['deepseek']['model'],
-                            base_url=conf['deepseek']['base_url'],
-                            api_key=conf['deepseek']['api_key'],
-                            model_info=model_deepseek_info,
+                    def s_roles_generate_testcases():
+                        # 配置DeepSeek
+                        deepseek_config = {
+                            "config_list": [{
+                                "model": conf['deepseek']['model'],
+                                "base_url": conf['deepseek']['base_url'],
+                                "api_key": conf['deepseek']['api_key'],
+                                "stream": True  # DeepSeek模型要求启用流模式
+                            }],
+                            "temperature": float(conf['deepseek']['temperature']) / 10,
+                            "max_tokens": int(conf['deepseek']['tokens'])
+                        }
+                        
+                        # 创建代理
+                        testcase_writer = get_testcase_writer(deepseek_config, customer_system_message)
+                        
+                        # 创建用户代理
+                        user_proxy = UserProxyAgent(
+                            name="user_proxy",
+                            human_input_mode="NEVER",
+                            max_consecutive_auto_reply=0,
+                            code_execution_config=False,
                         )
-                        testcase_writer = get_testcase_writer(model_deepseek_client, customer_system_message)
-                        team = RoundRobinGroupChat(
-                            participants=[testcase_writer],
-                            termination_condition=text_termination,
-                            max_turns=1
-                        )
+                        
                         # 创建一个空元素用于更新内容
                         with response_container:
                             placeholder = st.empty()
-                        async for chunk in team.run_stream(task=task):
-                            content = ""
-                            if chunk:
-                                # 处理不同类型的chunk
-                                if hasattr(chunk, 'content'):
-                                    if chunk.type != 'ModelClientStreamingChunkEvent':
-                                        content = chunk.content
-                                elif isinstance(chunk, str):
-                                    content = chunk
-                                else:
-                                    content = str(chunk)
-                                # 将新内容添加到完整响应中
-                                if is_continue and content != "" and not content.startswith("TaskResult"):
-                                    full_response += '\n\n' + content
-                                # 更新显示区域（替换而非追加）
-                                placeholder.markdown(full_response)
-                                # APPROVE结束退出
-                                if content.find("APPROVE") > 0:
-                                    is_continue = False
-
+                            placeholder.text("正在生成测试用例...")
+                        
+                        # 生成用例
+                        writer_result = user_proxy.initiate_chat(
+                            testcase_writer,
+                            message=task,
+                            max_turns=1,
+                            silent=True
+                        )
+                        
+                        # 获取回复
+                        full_response = ""
+                        if hasattr(testcase_writer, 'chat_messages'):
+                            chat_messages = testcase_writer.chat_messages.get(user_proxy, [])
+                            for msg in reversed(chat_messages):
+                                if msg.get('role') == 'assistant':
+                                    full_response = msg.get('content', '')
+                                    break
+                        
+                        # 更新显示
+                        with response_container:
+                            placeholder.markdown(full_response)
+                        
                         return full_response
 
                     # 重新拉取消息
@@ -500,7 +544,7 @@ def html_init():
                         if conf['deepseek']['api_key'] != "" and conf['qwen']['api_key'] != "":
                             try:
                                 with st.spinner("正在生成测试用例..."):
-                                    result = asyncio.run(m_roles_generate_testcases())
+                                    result = m_roles_generate_testcases()
                                     case_list = format_testcases(result)
                                 st.success("✅ 测试用例生成完成!")
                                 if len(case_list):
@@ -542,7 +586,7 @@ def html_init():
                         if conf['deepseek']['api_key'] != "":
                             try:
                                 with st.spinner("正在生成测试用例..."):
-                                    result = asyncio.run(s_roles_generate_testcases())
+                                    result = s_roles_generate_testcases()
                                     case_list = format_testcases(result)
                                 st.success("✅ 测试用例生成完成!")
                                 if len(case_list):
