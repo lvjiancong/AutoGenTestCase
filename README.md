@@ -2,7 +2,8 @@
 借助AI大模型帮助生成测试用例
 
 ### 打包程序下载地址
-https://pan.baidu.com/s/1Cftl4BiWh_reU-oCwW3aMg  提取码：6bwu
+#### window https://pan.baidu.com/s/1Cftl4BiWh_reU-oCwW3aMg  提取码：6bwu
+#### MAC https://pan.baidu.com/s/1CX9KM6lCcstCgWKpbPhAwQ 提取码: td7x
 
 ### 模型收费情况：
 #### DeepSeek申请apikey后需要充值金额才能使用，收费标准比较低2元可以使用上百次不止，放心大胆使用
